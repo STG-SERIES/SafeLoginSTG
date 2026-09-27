@@ -1,0 +1,8 @@
+# Ignore Gradle build output
+.gradle/
+build/
+out/
+*.iml
+.idea/
+*.class
+accounts.yml

@@ -1,0 +1,6 @@
+# Minimum password length for cracked accounts
+min-password-length: 4
+# Maximum password length
+max-password-length: 64
+# Seconds before an unauthenticated player is kicked
+auth-timeout-seconds: 120

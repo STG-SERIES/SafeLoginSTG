@@ -1,0 +1,18 @@
+name: SafeLoginSTG
+version: '${version}'
+main: com.safeloginstg.SafeLoginSTG
+api-version: '1.21'
+author: STG
+description: Hybrid auth for premium (Mojang) and cracked players via Paper dialogs.
+commands:
+  SLSTG:
+    description: SafeLoginSTG OP-only admin commands
+    usage: /SLSTG <setpswd|reset> <player> [password]
+    permission: safeloginstg.admin
+permissions:
+  safeloginstg.admin:
+    description: Allows SafeLoginSTG admin commands (OP-only)
+    default: op
+  safeloginstg.bypass:
+    description: Bypass authentication entirely
+    default: false
