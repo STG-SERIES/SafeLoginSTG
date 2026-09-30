@@ -3,6 +3,7 @@ package com.safeloginstg.auth;
 import com.safeloginstg.SafeLoginSTG;
 import com.safeloginstg.dialog.AuthDialogs;
 import com.safeloginstg.mojang.MojangPremiumChecker;
+import com.safeloginstg.mojang.MojangPremiumChecker.PremiumLookup;
 import com.safeloginstg.storage.YamlAuthRepository;
 import com.safeloginstg.storage.YamlAuthRepository.AccountRecord;
 import net.kyori.adventure.text.Component;
@@ -62,20 +63,33 @@ public final class AuthService {
 
         boolean serverOnlineMode = Bukkit.getOnlineMode();
         tokens.readToken(player).whenComplete((cookieToken, error) -> {
-            if (error != null) {
-                plugin.getLogger().warning("Failed to read client cookie for " + player.getName() + ": " + error.getMessage());
-            }
-            String safeCookie = error == null ? cookieToken : null;
+            String safeCookie = (error == null) ? cookieToken : null;
 
             if (serverOnlineMode) {
                 Bukkit.getScheduler().runTask(plugin, () -> continueJoin(player, true, safeCookie));
                 return;
             }
 
-            premiumChecker.isPremiumUsername(player.getName()).thenAccept(premiumName ->
-                    Bukkit.getScheduler().runTask(plugin, () -> continueJoin(player, premiumName, safeCookie))
+            premiumChecker.lookup(player.getName()).thenAccept(lookup ->
+                    Bukkit.getScheduler().runTask(plugin, () -> {
+                        boolean premiumName = resolvePremiumName(player.getName(), lookup);
+                        continueJoin(player, premiumName, safeCookie);
+                    })
             );
         });
+    }
+
+    /**
+     * Prefer a definitive Mojang answer; fall back to the sticky flag saved on the account
+     * when Mojang is rate-limited or unreachable.
+     */
+    private boolean resolvePremiumName(String playerName, PremiumLookup lookup) {
+        if (lookup.definitive()) {
+            return lookup.premium();
+        }
+        return repository.findAccount(playerName)
+                .map(account -> account.mojangPremium() || account.lastAuthMode() == AuthMode.PREMIUM)
+                .orElse(false);
     }
 
     private void continueJoin(Player player, boolean premiumName, String cookieToken) {
@@ -98,18 +112,63 @@ public final class AuthService {
             return;
         }
 
-        // Premium client that still owns the premium session can skip the password.
+        // Heal accounts wrongly demoted to CRACKED when cookies were missing (pre-fix bug).
         if (premiumName
-                && account.lastAuthMode() == AuthMode.PREMIUM
-                && trustedPremium) {
+                && account.lastAuthMode() == AuthMode.CRACKED
+                && !trustedCracked
+                && !ClientTokenService.hasCookie(cookieToken)) {
+            String healedPremium = account.premiumToken() != null
+                    ? account.premiumToken()
+                    : ClientTokenService.newToken();
+            repository.updateSession(
+                    player.getName(),
+                    AuthMode.PREMIUM,
+                    healedPremium,
+                    account.crackedToken(),
+                    true
+            );
+            account = repository.findAccount(player.getName()).orElse(account);
+            tokens.writeToken(player, healedPremium);
+        }
+
+        /*
+         * Premium auto-login:
+         * - Mojang premium (or sticky mojang-premium) username
+         * - Account not currently marked CRACKED (cracked client used this name)
+         * - Do NOT require a matching cookie — cookies are unreliable and were demoting
+         *   premium players to CRACKED, forcing a password every join.
+         *
+         * Only force a password for a premium name when:
+         * - last mode is CRACKED (needs one reclaim login), or
+         * - client cookie positively matches the cracked token.
+         */
+        if (premiumName && account.lastAuthMode() != AuthMode.CRACKED && !trustedCracked) {
             markAuthenticated(player, Component.text(
-                    "Premium session recognized — logged in automatically.",
+                    "Premium account — logged in automatically.",
                     NamedTextColor.GREEN
             ));
+            // Refresh premium cookie in the background when possible.
+            if (account.premiumToken() != null) {
+                tokens.writeToken(player, account.premiumToken());
+            }
             return;
         }
 
-        // Everyone else (cracked, or premium after a cracked login) must enter the password.
+        if (premiumName && trustedCracked) {
+            // Known cracked launcher cookie on a premium username → password every time.
+            states.put(player.getUniqueId(), AuthState.NEED_LOGIN);
+            dialogs.showLogin(player, null);
+            return;
+        }
+
+        if (premiumName && account.lastAuthMode() == AuthMode.CRACKED) {
+            // Premium client reclaiming after a cracked session — password once.
+            states.put(player.getUniqueId(), AuthState.NEED_LOGIN);
+            dialogs.showLogin(player, null);
+            return;
+        }
+
+        // Cracked-only usernames: always login.
         states.put(player.getUniqueId(), AuthState.NEED_LOGIN);
         dialogs.showLogin(player, null);
     }
@@ -170,7 +229,7 @@ public final class AuthService {
         var accountOpt = repository.findAccount(player.getName());
         if (accountOpt.isEmpty()) {
             states.put(player.getUniqueId(), AuthState.NEED_REGISTER);
-            dialogs.showRegister(player, "No account found. Please create a password.");
+            dialogs.showRegister(player, "No account found. Please create a new password.");
             return;
         }
 
@@ -184,7 +243,6 @@ public final class AuthService {
                 player.getUniqueId(),
                 new JoinContext(false, null, false, false)
         );
-        // Refresh trust flags against the latest stored tokens.
         context = new JoinContext(
                 context.premiumName(),
                 context.cookieToken(),
@@ -200,65 +258,44 @@ public final class AuthService {
     /**
      * Updates last-auth-mode and client cookies after a successful password auth.
      *
-     * <p>Premium Mojang names can auto-login only while {@link AuthMode#PREMIUM} and the
-     * client still holds the premium cookie. Switching to a cracked client marks the
-     * account {@link AuthMode#CRACKED}; the next premium client must enter the password
-     * once to reclaim premium auto-login.</p>
+     * <p>Important: a missing cookie must NOT demote a Mojang premium username to
+     * {@link AuthMode#CRACKED}. That was causing premium players to enter a password
+     * on every join.</p>
      */
     private void finalizeAuth(Player player, JoinContext context, boolean firstRegister) {
         AccountRecord existing = repository.findAccount(player.getName()).orElse(null);
         String premiumToken = existing == null ? null : existing.premiumToken();
         String crackedToken = existing == null ? null : existing.crackedToken();
-        AuthMode lastMode = existing == null ? AuthMode.NONE : existing.lastAuthMode();
 
         AuthMode newMode;
         String newPremium = premiumToken;
         String newCracked = crackedToken;
         String cookieToStore;
+        boolean mojangPremium = context.premiumName()
+                || (existing != null && existing.mojangPremium());
 
         if (!context.premiumName()) {
             // Non-premium usernames are always cracked sessions.
             newMode = AuthMode.CRACKED;
             newCracked = ClientTokenService.newToken();
             cookieToStore = newCracked;
-        } else if (firstRegister) {
-            // First-time premium username: create password, then allow auto-login on this client.
+            mojangPremium = false;
+        } else if (context.trustedCracked() && !firstRegister) {
+            // Positive cracked-client cookie on a premium username → stay cracked.
+            newMode = AuthMode.CRACKED;
+            newCracked = ClientTokenService.newToken();
+            cookieToStore = newCracked;
+            mojangPremium = true;
+        } else {
+            // Premium username: register, reclaim, or normal login → PREMIUM.
+            // Missing cookies no longer demote the account.
             newMode = AuthMode.PREMIUM;
             newPremium = ClientTokenService.newToken();
             cookieToStore = newPremium;
-        } else if (lastMode == AuthMode.CRACKED) {
-            if (context.trustedPremium()) {
-                // Returning premium launcher reclaiming the account after a cracked login.
-                newMode = AuthMode.PREMIUM;
-                newPremium = ClientTokenService.newToken();
-                cookieToStore = newPremium;
-            } else if (context.trustedCracked()) {
-                // Same cracked client logging in again — stay cracked (password every time).
-                newMode = AuthMode.CRACKED;
-                newCracked = ClientTokenService.newToken();
-                cookieToStore = newCracked;
-            } else {
-                // Unknown / new cracked-style client while account is in cracked mode.
-                newMode = AuthMode.CRACKED;
-                newCracked = ClientTokenService.newToken();
-                cookieToStore = newCracked;
-            }
-        } else {
-            // lastMode PREMIUM or NONE, but this client is not the trusted premium cookie holder
-            // (cracked impostor, or premium cookie lost) → mark cracked for this client.
-            if (context.trustedPremium()) {
-                newMode = AuthMode.PREMIUM;
-                newPremium = ClientTokenService.newToken();
-                cookieToStore = newPremium;
-            } else {
-                newMode = AuthMode.CRACKED;
-                newCracked = ClientTokenService.newToken();
-                // Keep existing premium token so the real premium client can reclaim later.
-                cookieToStore = newCracked;
-            }
+            mojangPremium = true;
         }
 
-        repository.updateSession(player.getName(), newMode, newPremium, newCracked);
+        repository.updateSession(player.getName(), newMode, newPremium, newCracked, mojangPremium);
         tokens.writeToken(player, cookieToStore);
     }
 
@@ -308,8 +345,9 @@ public final class AuthService {
                 joinContexts.put(id, new JoinContext(true, null, false, false));
                 showRegister.run();
             } else {
-                premiumChecker.isPremiumUsername(online.getName()).thenAccept(premiumName ->
+                premiumChecker.lookup(online.getName()).thenAccept(lookup ->
                         Bukkit.getScheduler().runTask(plugin, () -> {
+                            boolean premiumName = lookup.definitive() && lookup.premium();
                             joinContexts.put(id, new JoinContext(premiumName, null, false, false));
                             showRegister.run();
                         })

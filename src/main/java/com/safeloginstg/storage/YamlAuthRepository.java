@@ -54,7 +54,8 @@ public final class YamlAuthRepository {
                 config.getString(base + ".hash"),
                 AuthMode.fromStorage(config.getString(base + ".last-auth-mode")),
                 config.getString(base + ".premium-token"),
-                config.getString(base + ".cracked-token")
+                config.getString(base + ".cracked-token"),
+                config.getBoolean(base + ".mojang-premium", false)
         ));
     }
 
@@ -64,10 +65,6 @@ public final class YamlAuthRepository {
 
     public boolean hasAccount(String playerName) {
         return findPasswordHash(playerName).isPresent();
-    }
-
-    public AuthMode getLastAuthMode(String playerName) {
-        return findAccount(playerName).map(AccountRecord::lastAuthMode).orElse(AuthMode.NONE);
     }
 
     public synchronized void upsertPassword(String playerName, UUID uuid, String passwordHash) {
@@ -88,7 +85,8 @@ public final class YamlAuthRepository {
             String playerName,
             AuthMode lastAuthMode,
             String premiumToken,
-            String crackedToken
+            String crackedToken,
+            boolean mojangPremium
     ) {
         String base = path(playerName);
         if (!config.contains(base + ".hash")) {
@@ -97,6 +95,7 @@ public final class YamlAuthRepository {
         config.set(base + ".last-auth-mode", lastAuthMode.name());
         config.set(base + ".premium-token", premiumToken);
         config.set(base + ".cracked-token", crackedToken);
+        config.set(base + ".mojang-premium", mojangPremium);
         config.set(base + ".updated-at", System.currentTimeMillis());
         save();
     }
@@ -136,7 +135,8 @@ public final class YamlAuthRepository {
             String passwordHash,
             AuthMode lastAuthMode,
             String premiumToken,
-            String crackedToken
+            String crackedToken,
+            boolean mojangPremium
     ) {
     }
 }

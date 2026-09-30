@@ -23,7 +23,7 @@ import java.util.logging.Level;
 public final class MojangPremiumChecker {
 
     private static final String PROFILE_URL = "https://api.mojang.com/users/profiles/minecraft/";
-    private static final long CACHE_TTL_MS = 10 * 60 * 1000L;
+    private static final long CACHE_TTL_MS = 30 * 60 * 1000L;
 
     private final JavaPlugin plugin;
     private final HttpClient httpClient;
@@ -37,16 +37,20 @@ public final class MojangPremiumChecker {
                 .build();
     }
 
-    public CompletableFuture<Boolean> isPremiumUsername(String username) {
+    /**
+     * @return result with {@code definitive=false} when Mojang could not be reached / rate-limited
+     */
+    public CompletableFuture<PremiumLookup> lookup(String username) {
         String key = username.toLowerCase();
         CacheEntry cached = cache.get(key);
         if (cached != null && !cached.expired()) {
-            return CompletableFuture.completedFuture(cached.premium());
+            return CompletableFuture.completedFuture(new PremiumLookup(cached.premium(), true));
         }
 
         return CompletableFuture.supplyAsync(() -> {
             try {
-                String encoded = URLEncoder.encode(username, StandardCharsets.UTF_8);
+                // Mojang expects the raw username in the path; only encode unsafe chars.
+                String encoded = URLEncoder.encode(username, StandardCharsets.UTF_8).replace("+", "%20");
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(URI.create(PROFILE_URL + encoded))
                         .timeout(Duration.ofSeconds(8))
@@ -57,25 +61,25 @@ public final class MojangPremiumChecker {
                 HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
                 int status = response.statusCode();
 
-                boolean premium;
                 if (status == 200) {
                     JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
-                    premium = json.has("id") && !json.get("id").getAsString().isBlank();
-                } else if (status == 204 || status == 404) {
-                    premium = false;
-                } else if (status == 429) {
-                    plugin.getLogger().warning("Mojang API rate-limited while checking " + username + "; treating as cracked.");
-                    premium = false;
-                } else {
-                    plugin.getLogger().warning("Unexpected Mojang API status " + status + " for " + username + "; treating as cracked.");
-                    premium = false;
+                    boolean premium = json.has("id") && !json.get("id").getAsString().isBlank();
+                    cache.put(key, new CacheEntry(premium, System.currentTimeMillis() + CACHE_TTL_MS));
+                    return new PremiumLookup(premium, true);
                 }
-
-                cache.put(key, new CacheEntry(premium, System.currentTimeMillis() + CACHE_TTL_MS));
-                return premium;
+                if (status == 204 || status == 404) {
+                    cache.put(key, new CacheEntry(false, System.currentTimeMillis() + CACHE_TTL_MS));
+                    return new PremiumLookup(false, true);
+                }
+                if (status == 429) {
+                    plugin.getLogger().warning("Mojang API rate-limited while checking " + username + ".");
+                    return new PremiumLookup(false, false);
+                }
+                plugin.getLogger().warning("Unexpected Mojang API status " + status + " for " + username + ".");
+                return new PremiumLookup(false, false);
             } catch (Exception e) {
-                plugin.getLogger().log(Level.WARNING, "Failed to query Mojang for " + username + "; treating as cracked.", e);
-                return false;
+                plugin.getLogger().log(Level.WARNING, "Failed to query Mojang for " + username + ".", e);
+                return new PremiumLookup(false, false);
             }
         });
     }
@@ -86,6 +90,9 @@ public final class MojangPremiumChecker {
             return Optional.empty();
         }
         return Optional.of(cached.premium());
+    }
+
+    public record PremiumLookup(boolean premium, boolean definitive) {
     }
 
     private record CacheEntry(boolean premium, long expiresAt) {
